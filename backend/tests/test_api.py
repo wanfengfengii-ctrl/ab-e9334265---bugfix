@@ -79,6 +79,48 @@ def test_match_ambiguous_two_witnesses():
         assert (mods, tot, mx) == (0, 0, 0)
 
 
+def test_match_parallel_optimal_same_offset():
+    # 回归：同一起点并列最优切分被漏计（最大组误差非加性）。
+    # 须裁决 ambiguous，精确计数 "2"，两份互不相同的规范见证。
+    ref_intervals = [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]
+    meas_intervals = [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]
+    payload = _payload(
+        reference={"blades": BLADES12, "intervals": ref_intervals},
+        measured={"intervals": meas_intervals},
+        tolerance=3,
+        budget=2,
+    )
+    r = client.post("/api/match", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "ambiguous"
+    assert data["objective"] == {
+        "modifications": 2,
+        "totalAbsError": 18,
+        "maxGroupError": 3,
+    }
+    assert data["optimalMappingCount"] == 2
+    assert data["optimalMappingCountText"] == "2"
+    assert data["budget"] == {"limit": 2, "used": 2, "within": True}
+    assert data["circumference"] == 73
+    witnesses = data["witnesses"]
+    assert len(witnesses) == 2
+    a, b = witnesses
+    assert a["mappingId"] != b["mappingId"]
+    for w in (a, b):
+        assert w["direction"] == "forward" and w["offset"] == 3
+        assert len(w["groups"]) == 10
+        assert [g["refCount"] for g in w["groups"]] in (
+            [1, 2, 1, 1, 1, 1, 2, 1, 1, 1],
+            [2, 1, 1, 1, 1, 1, 2, 1, 1, 1],
+        )
+        assert all(len(g["measIndices"]) == 1 for g in w["groups"])
+        mods = sum(g["modifications"] for g in w["groups"])
+        tot = sum(g["absError"] for g in w["groups"])
+        mx = max(g["absError"] for g in w["groups"])
+        assert (mods, tot, mx) == (2, 18, 3)
+
+
 def test_match_no_solution():
     payload = _payload(
         reference={"blades": BLADES12, "intervals": [50] * 12},

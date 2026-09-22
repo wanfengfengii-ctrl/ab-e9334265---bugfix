@@ -235,27 +235,74 @@ def test_ambiguous_within_single_config():
         assert w.objective == Objective(1, 4, 2)
 
 
+def test_parallel_optimal_same_offset():
+    # 回归：同一起点下的并列最优切分曾因最大组误差非加性被漏计。
+    # 正向 offset=3 时两种切分 [1,2,1,1,1,1,2,1,1,1] 与
+    # [2,1,1,1,1,1,2,1,1,1] 都达到 (2, 18, 3)，逐组误差分别为
+    # [1,1,3,3,1,2,1,2,2,2] 与 [2,0,3,3,1,2,1,2,2,2]。
+    ref = [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]
+    meas = [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]
+    assert sum(ref) == sum(meas) == 73
+    r = solve(ref, meas, 3)
+    assert r.status == "ambiguous"
+    assert r.objective == Objective(2, 18, 3)
+    assert r.optimal_count == 2
+    assert str(r.optimal_count) == "2"
+    assert len(r.witnesses) == 2
+    # 两份见证同属正向起点 3（实测侧均为单间隔组），规范形式互不相同
+    for w in r.witnesses:
+        assert (w.direction, w.offset) == ("forward", 3)
+        assert [g.ref_count for g in w.groups] in (
+            [1, 2, 1, 1, 1, 1, 2, 1, 1, 1],
+            [2, 1, 1, 1, 1, 1, 2, 1, 1, 1],
+        )
+        assert all(len(g.meas_indices) == 1 for g in w.groups)
+        assert w.objective == Objective(2, 18, 3)
+    assert r.witnesses[0].mapping_id() != r.witnesses[1].mapping_id()
+    error_vectors = {tuple(g.abs_error for g in w.groups) for w in r.witnesses}
+    assert error_vectors == {
+        (1, 1, 3, 3, 1, 2, 1, 2, 2, 2),
+        (2, 0, 3, 3, 1, 2, 1, 2, 2, 2),
+    }
+
+
+def test_nonadditive_max_tie_small():
+    # 最小化回归案例：旧的三关键（含非加性最大误差）DP 把全局最优计数 5
+    # 漏计为 4。与暴力枚举对照锁定。
+    ref = [4, 6, 3, 1, 7]
+    meas = [7, 2, 2, 3, 6, 1]
+    expected_obj, expected_count = brute_force(ref, meas, 3)
+    assert expected_obj == (1, 6, 3)
+    assert expected_count == 5
+    r = solve(ref, meas, 3)
+    assert r.status == "ambiguous"
+    assert r.objective.as_tuple() == expected_obj
+    assert r.optimal_count == expected_count
+    assert len(r.witnesses) == 2
+    assert r.witnesses[0].mapping_id() != r.witnesses[1].mapping_id()
+
+
 # ---------------------------------------------------------------------------
 # 随机对照：DP vs 暴力枚举
 # ---------------------------------------------------------------------------
 
 def _random_case(rng: random.Random):
-    n = rng.randint(3, 7)
-    m = rng.randint(3, 7)
-    ref = [rng.randint(1, 7) for _ in range(n)]
+    n = rng.randint(3, 8)
+    m = rng.randint(3, 8)
+    ref = [rng.randint(1, 8) for _ in range(n)]
     # 构造等周长实测环：先随机再补差
-    meas = [rng.randint(1, 7) for _ in range(m - 1)]
+    meas = [rng.randint(1, 8) for _ in range(m - 1)]
     last = sum(ref) - sum(meas)
     if last < 1:
         meas.append(1)
         ref[0] += 1 - last
     else:
         meas.append(last)
-    tolerance = rng.randint(0, 4)
+    tolerance = rng.randint(0, 5)
     return ref, meas, tolerance
 
 
-@pytest.mark.parametrize("seed", range(60))
+@pytest.mark.parametrize("seed", range(150))
 def test_against_brute_force(seed: int):
     rng = random.Random(10_000 + seed)
     ref, meas, tolerance = _random_case(rng)

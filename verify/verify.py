@@ -157,6 +157,43 @@ def api_realistic():
 
 
 @api_check
+def api_parallel_optimal_same_offset():
+    """API：同一起点并列最优切分（ambiguous，精确计数 2，两份互异见证）"""
+    body = load_example("unique")
+    body["reference"]["intervals"] = [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]
+    body["measured"] = {"intervals": [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]}
+    body["tolerance"] = 3
+    body["budget"] = 2
+    code, data = http_json("POST", f"{API_URL}/match", body)
+    assert code == 200, data
+    assert data["status"] == "ambiguous", data["status"]
+    assert data["objective"] == {
+        "modifications": 2,
+        "totalAbsError": 18,
+        "maxGroupError": 3,
+    }, data["objective"]
+    assert data["optimalMappingCount"] == 2, data["optimalMappingCount"]
+    assert data["optimalMappingCountText"] == "2"
+    assert data["budget"] == {"limit": 2, "used": 2, "within": True}
+    witnesses = data["witnesses"]
+    assert len(witnesses) == 2
+    a, b = witnesses
+    assert a["mappingId"] != b["mappingId"], "两份见证的规范映射必须不同"
+    for w in (a, b):
+        assert (w["direction"], w["offset"]) == ("forward", 3)
+        assert len(w["groups"]) == 10
+        splits = [g["refCount"] for g in w["groups"]]
+        assert splits in (
+            [1, 2, 1, 1, 1, 1, 2, 1, 1, 1],
+            [2, 1, 1, 1, 1, 1, 2, 1, 1, 1],
+        ), splits
+        mods = sum(g["modifications"] for g in w["groups"])
+        tot = sum(g["absError"] for g in w["groups"])
+        mx = max(g["absError"] for g in w["groups"])
+        assert (mods, tot, mx) == (2, 18, 3), (mods, tot, mx)
+
+
+@api_check
 def api_circumference_422():
     """API：周长不等返回 422"""
     body = load_example("unique")
@@ -251,6 +288,41 @@ def run_browser_checks() -> None:
             id_b = page.locator('[data-testid="mapping-id"]').inner_text()
             assert id_a != id_b, f"切换见证后映射 ID 应变化：{id_a} vs {id_b}"
             page.screenshot(path=f"{ARTIFACTS}/02-ambiguous.png", full_page=True)
+
+        @ui_check
+        def ui_parallel_optimal_same_offset():
+            """浏览器：同一起点并列切分输入显示歧义与计数 2（求解→API→页面一致）"""
+            load_preset("unique")
+            ref_intervals = [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]
+            for i, v in enumerate(ref_intervals):
+                page.fill(f'[data-testid="blade-interval-{i}"]', str(v))
+            page.fill(
+                '[data-testid="meas-input"]',
+                "9, 10, 3, 5, 5, 7, 6, 6, 6, 16",
+            )
+            page.fill('[data-testid="tolerance-input"]', "3")
+            page.fill('[data-testid="budget-input"]', "2")
+            page.click('[data-testid="align-button"]')
+            banner = page.locator('[data-testid="status-banner"]')
+            expect(banner).to_have_attribute("data-status", "ambiguous")
+            # 三级最优目标与精确计数 2 一致呈现
+            expect(page.locator('[data-testid="stat-mods"]')).to_have_text("2")
+            expect(page.locator('[data-testid="stat-total"]')).to_have_text("18")
+            expect(page.locator('[data-testid="stat-max"]')).to_have_text("3")
+            expect(page.locator('[data-testid="stat-count"]')).to_have_text("2")
+            expect(page.locator('[data-testid="budget-line"]')).to_contain_text("在预算内")
+            # 两份见证：均为正向起点 #3，10 个组，切换后映射 ID 改变
+            expect(page.locator('[data-testid="witness-tab-0"]')).to_be_visible()
+            expect(page.locator('[data-testid="witness-tab-1"]')).to_be_visible()
+            expect(page.locator('[data-testid="witness-tab-0"]')).to_contain_text("正向")
+            expect(page.locator('[data-testid="witness-tab-0"]')).to_contain_text("起点 #3")
+            expect(page.locator(".group-arc-ref")).to_have_count(10)
+            expect(page.locator('[data-testid="group-table"] tbody tr')).to_have_count(10)
+            id_a = page.locator('[data-testid="mapping-id"]').inner_text()
+            page.click('[data-testid="witness-tab-1"]')
+            id_b = page.locator('[data-testid="mapping-id"]').inner_text()
+            assert id_a != id_b, f"两份见证映射 ID 必须不同：{id_a} vs {id_b}"
+            page.screenshot(path=f"{ARTIFACTS}/05-parallel-optimal.png", full_page=True)
 
         @ui_check
         def ui_no_solution():

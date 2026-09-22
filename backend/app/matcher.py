@@ -16,12 +16,26 @@
 求解策略
 --------
 固定参考环起点（叶片编号是绝对坐标），完整枚举实测环的两个方向与全部
-m 个起点，共 2m 个候选配置。对每个配置做分组动态规划；所有配置的 DP
-以 numpy 向量化方式批量推进（按参考环前缀逐行滚动，每行对所有配置与
-实测位置同时求字典序最优），并同步维护最优路径计数，从而判定最优规范
-映射唯一、歧义还是无解。计数必须精确：快速路径以 int64 推进并在
-``_COUNT_SAT`` 处饱和探测，一旦触及阈值即以 Python 任意精度整数重算，
-因此任意规模输入的最优映射数都是精确值（可超出 int64 / JS 安全整数）。
+m 个起点，共 2m 个候选配置。求解分两遍向量化推进（均按参考前缀逐行
+滚动，每行对所有配置与实测位置同时计算）：
+
+1. **代价遍** ``_dp_values``：分组 DP，``dp[i][j]`` 保存最优字典序代价
+   (改动数, 总绝对误差, 最大组误差)。注意最大组误差是**非加性的瓶颈
+   量**：同一前缀单元内，(改动数, 总误差) 相同而当前最大误差较大的状态
+   可能被暂时支配，却在后续组出现同量级误差时重新并列（见
+   ``test_parallel_optimal_same_offset`` 回归案例）。该遍只用于求代价
+   值——字典序支配对最优值安全（更差的前缀不可能仅靠“取 max”反超），
+   但**不能**据此计数或重构路径。
+2. **计数遍** ``_dp_counts``：得到全局最优三元组 (m*, t*, e*) 后，以
+   “每组误差 ≤ e*”为硬约束，对加性目标 (改动数, 总误差) 再做一遍分组
+   DP 并对并列转移求和。在最优配置上，达到 (m*, t*) 的可行路径与全局
+   最优规范映射一一对应（任何 cap 内更优的加性前缀都会与代价遍结果矛盾，
+   而终点最大误差不可能低于全局最小 e*），故计数精确。
+
+计数快速路径以 int64 推进并在 ``_COUNT_SAT`` 处饱和探测，一旦触及阈值
+即以 Python 任意精度整数重算，因此任意规模输入的最优映射数都是精确值
+（可超出 int64 / JS 安全整数）。见证重构使用同一“硬 cap + 加性目标”的
+标量 DP 回溯，可枚举出被代价遍错误剪枝的并列切分。
 
 规范映射
 --------
@@ -162,19 +176,17 @@ def _aligned_prefix_sums(meas: list[int], m: int) -> np.ndarray:
     return out
 
 
-def _dp_all_configs(
-    ref: list[int], meas: list[int], tolerance: int, exact: bool = False
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """对所有 2m 个配置同时做分组 DP，返回最后一行的代价与计数数组。
+def _dp_values(
+    ref: list[int], meas: list[int], tolerance: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """代价遍：所有 2m 个配置同时做分组 DP，返回终点行三个代价分量。
 
     dp[i][j]：参考环前 i 个间隔与（某配置下）实测环前 j 个间隔对齐的
-    最优字典序代价 (改动数, 总绝对误差, 最大组误差) 及最优路径计数。
-    转移枚举最后一组两侧的跨度 (a, b) ∈ {1,2,3}²。
+    最优字典序代价 (改动数, 总绝对误差, 最大组误差)。转移枚举最后一组
+    两侧的跨度 (a, b) ∈ {1,2,3}²。
 
-    ``exact=False``（快速路径）：计数为 int64，并在 ``_COUNT_SAT`` 处饱和
-    —— 低于阈值的计数是精确的，达到阈值仅表示“需要任意精度重算”。
-    阈值取 (1<<62)-1：饱和值相加不溢出 int64。
-    ``exact=True``：计数使用 Python 任意精度整数（object 数组），结果精确。
+    本遍**不维护计数**：最大组误差非加性，前缀单元内被字典序剪枝的状态
+    仍可能在全局并列（见模块文档），故计数统一由 ``_dp_counts`` 完成。
     """
     n, m = len(ref), len(meas)
     S = 2 * m
@@ -190,23 +202,18 @@ def _dp_all_configs(
     PR = np.zeros(n + 1, dtype=np.int64)
     np.cumsum(np.asarray(ref, dtype=np.int64), out=PR[1:])
 
-    cnt_dtype = object if exact else np.int64
-
     def _blank_row() -> list[np.ndarray]:
-        return [np.full((S, m + 1), _INF, dtype=np.int64) for _ in range(3)] + \
-               [np.zeros((S, m + 1), dtype=cnt_dtype)]
+        return [np.full((S, m + 1), _INF, dtype=np.int64) for _ in range(3)]
 
     rows = [_blank_row() for _ in range(MAX_SPAN + 1)]
-    rows[0][0][:, 0] = 0  # 基础情形 dp[0][0] = (0, 0, 0)，计数 1
+    rows[0][0][:, 0] = 0  # 基础情形 dp[0][0] = (0, 0, 0)
     rows[0][1][:, 0] = 0
     rows[0][2][:, 0] = 0
-    rows[0][3][:, 0] = 1
 
     for i in range(1, n + 1):
         cur = rows[i % (MAX_SPAN + 1)]
-        for arr in cur[:3]:
+        for arr in cur:
             arr.fill(_INF)
-        cur[3].fill(0)
 
         # 列窗口：由每组 1..3 个间隔的结构性约束剪枝
         lo = max((i + MAX_SPAN - 1) // MAX_SPAN, m - MAX_SPAN * (n - i), 1)
@@ -225,8 +232,7 @@ def _dp_all_configs(
                     continue
                 js = slice(jlo, hi + 1)
                 src = slice(jlo - b, hi + 1 - b)
-                c_mods, c_tot = cur[0][:, js], cur[1][:, js]
-                c_max, c_cnt = cur[2][:, js], cur[3][:, js]
+                c_mods, c_tot, c_max = cur[0][:, js], cur[1][:, js], cur[2][:, js]
 
                 Gb = G[b - 1][:, js]
                 err = np.abs(ref_sum - Gb)
@@ -239,7 +245,6 @@ def _dp_all_configs(
                 n_mods = prev[0][:, src] + (a + b - 2)
                 n_tot = prev[1][:, src] + err
                 n_max = np.maximum(prev[2][:, src], err)
-                n_cnt = prev[3][:, src]
                 np.minimum(n_mods, _INF, out=n_mods)    # 截断防溢出
                 np.minimum(n_tot, _INF, out=n_tot)
 
@@ -248,11 +253,102 @@ def _dp_all_configs(
                     | ((n_mods == c_mods) & (n_tot < c_tot))
                     | ((n_mods == c_mods) & (n_tot == c_tot) & (n_max < c_max))
                 )
-                tied = ok & ~better & (n_mods == c_mods) & (n_tot == c_tot) & (n_max == c_max)
 
                 np.copyto(c_mods, n_mods, where=better)
                 np.copyto(c_tot, n_tot, where=better)
                 np.copyto(c_max, n_max, where=better)
+
+    return rows[n % (MAX_SPAN + 1)]
+
+
+def _dp_counts(
+    ref: list[int], meas: list[int], error_cap: int, exact: bool = False
+) -> np.ndarray:
+    """计数遍：在“每组误差 ≤ error_cap”硬约束下，对加性目标
+    (改动数, 总绝对误差) 求最优并维护其路径数，返回终点行计数。
+
+    目标的第三关键字（最大组误差）被替换为可行性约束后变成纯加性 DP：
+    每个单元只需保留唯一最优 (改动数, 总误差)，到达它的全部路径都应计入
+    ——不存在非加性剪枝漏计。代价遍求得全局最优 (m*, t*, e*) 后，在
+    error_cap = e* 下达到 (m*, t*) 的路径恰为全部全局最优规范映射。
+
+    ``exact=False``（快速路径）：计数为 int64，并在 ``_COUNT_SAT`` 处饱和
+    —— 低于阈值的计数是精确的，达到阈值仅表示“需要任意精度重算”。
+    阈值取 (1<<62)-1：饱和值相加不溢出 int64。
+    ``exact=True``：计数使用 Python 任意精度整数（object 数组），结果精确。
+    """
+    n, m = len(ref), len(meas)
+    S = 2 * m
+    PS = _aligned_prefix_sums(meas, m)
+
+    G = []
+    for b in (1, 2, 3):
+        Gb = np.full((S, m + 1), -1, dtype=np.int64)
+        Gb[:, b:] = PS[:, b:] - PS[:, :-b]
+        G.append(Gb)
+
+    PR = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(np.asarray(ref, dtype=np.int64), out=PR[1:])
+
+    cnt_dtype = object if exact else np.int64
+
+    def _blank_row() -> list[np.ndarray]:
+        return [
+            np.full((S, m + 1), _INF, dtype=np.int64),
+            np.full((S, m + 1), _INF, dtype=np.int64),
+            np.zeros((S, m + 1), dtype=cnt_dtype),
+        ]
+
+    rows = [_blank_row() for _ in range(MAX_SPAN + 1)]
+    rows[0][0][:, 0] = 0  # 基础情形 dp[0][0] = (0, 0)，计数 1
+    rows[0][1][:, 0] = 0
+    rows[0][2][:, 0] = 1
+
+    for i in range(1, n + 1):
+        cur = rows[i % (MAX_SPAN + 1)]
+        cur[0].fill(_INF)
+        cur[1].fill(_INF)
+        cur[2].fill(0)
+
+        lo = max((i + MAX_SPAN - 1) // MAX_SPAN, m - MAX_SPAN * (n - i), 1)
+        hi = min(MAX_SPAN * i, m - (n - i + MAX_SPAN - 1) // MAX_SPAN)
+        if lo > hi:
+            continue
+
+        for a in (1, 2, 3):
+            if a > i:
+                break
+            prev = rows[(i - a) % (MAX_SPAN + 1)]
+            ref_sum = int(PR[i] - PR[i - a])
+            for b in (1, 2, 3):
+                jlo = max(lo, b)
+                if jlo > hi:
+                    continue
+                js = slice(jlo, hi + 1)
+                src = slice(jlo - b, hi + 1 - b)
+                c_mods, c_tot, c_cnt = cur[0][:, js], cur[1][:, js], cur[2][:, js]
+
+                Gb = G[b - 1][:, js]
+                err = np.abs(ref_sum - Gb)
+                np.copyto(err, _BIG_ERR, where=Gb < 0)
+                ok = err <= error_cap
+                ok &= prev[0][:, src] < _INF
+                if not ok.any():
+                    continue
+
+                n_mods = prev[0][:, src] + (a + b - 2)
+                n_tot = prev[1][:, src] + err
+                n_cnt = prev[2][:, src]
+                np.minimum(n_mods, _INF, out=n_mods)
+                np.minimum(n_tot, _INF, out=n_tot)
+
+                better = ok & (
+                    (n_mods < c_mods) | ((n_mods == c_mods) & (n_tot < c_tot))
+                )
+                tied = ok & ~better & (n_mods == c_mods) & (n_tot == c_tot)
+
+                np.copyto(c_mods, n_mods, where=better)
+                np.copyto(c_tot, n_tot, where=better)
                 np.copyto(c_cnt, n_cnt, where=better)
                 if tied.any():
                     if exact:
@@ -260,15 +356,20 @@ def _dp_all_configs(
                     else:
                         np.copyto(c_cnt, np.minimum(c_cnt + n_cnt, _COUNT_SAT), where=tied)
 
-    return rows[n % (MAX_SPAN + 1)]
+    return rows[n % (MAX_SPAN + 1)][2]
 
 
 # ---------------------------------------------------------------------------
 # 见证重构（单配置标量 DP + 回溯）
 # ---------------------------------------------------------------------------
 
-def _scalar_dp(ref: list[int], vals: list[int], tolerance: int):
-    """单配置完整 DP 网格，供回溯使用。vals 为对齐后的实测间隔序列。"""
+def _scalar_dp(ref: list[int], vals: list[int], error_cap: int):
+    """单配置完整 DP 网格，供回溯使用。vals 为对齐后的实测间隔序列。
+
+    与计数遍一致：每组误差不得超过 ``error_cap``（全局最优最大组误差），
+    在此硬约束下最小化加性目标 (改动数, 总绝对误差)。键只有两维且均加性，
+    故被代价遍按当前最大误差剪枝的并列切分在此可见。
+    """
     n, m = len(ref), len(vals)
     PR = [0] * (n + 1)
     for i, v in enumerate(ref):
@@ -277,9 +378,9 @@ def _scalar_dp(ref: list[int], vals: list[int], tolerance: int):
     for j, v in enumerate(vals):
         PM[j + 1] = PM[j] + v
 
-    dp: list[list[tuple[int, int, int] | None]] = \
+    dp: list[list[tuple[int, int] | None]] = \
         [[None] * (m + 1) for _ in range(n + 1)]
-    dp[0][0] = (0, 0, 0)
+    dp[0][0] = (0, 0)
     for i in range(n + 1):
         for j in range(m + 1):
             if i == 0 and j == 0:
@@ -293,19 +394,19 @@ def _scalar_dp(ref: list[int], vals: list[int], tolerance: int):
                     if b > j:
                         break
                     err = abs(rs - (PM[j] - PM[j - b]))
-                    if err > tolerance:
+                    if err > error_cap:
                         continue
                     prev = dp[i - a][j - b]
                     if prev is None:
                         continue
-                    cand = (prev[0] + a + b - 2, prev[1] + err, max(prev[2], err))
+                    cand = (prev[0] + a + b - 2, prev[1] + err)
                     if best is None or cand < best:
                         best = cand
             dp[i][j] = best
     return dp, PR, PM
 
 
-def _optimal_transitions(dp, PR, PM, tolerance, i, j) -> list[tuple[int, int]]:
+def _optimal_transitions(dp, PR, PM, error_cap, i, j) -> list[tuple[int, int]]:
     """单元 (i, j) 的全部最优转移（保持确定性的枚举顺序）。"""
     best = dp[i][j]
     out = []
@@ -317,12 +418,12 @@ def _optimal_transitions(dp, PR, PM, tolerance, i, j) -> list[tuple[int, int]]:
             if b > j:
                 break
             err = abs(rs - (PM[j] - PM[j - b]))
-            if err > tolerance:
+            if err > error_cap:
                 continue
             prev = dp[i - a][j - b]
             if prev is None:
                 continue
-            cand = (prev[0] + a + b - 2, prev[1] + err, max(prev[2], err))
+            cand = (prev[0] + a + b - 2, prev[1] + err)
             if cand == best:
                 out.append((a, b))
     return out
@@ -331,12 +432,15 @@ def _optimal_transitions(dp, PR, PM, tolerance, i, j) -> list[tuple[int, int]]:
 def _reconstruct(
     ref: list[int],
     meas: list[int],
-    tolerance: int,
+    error_cap: int,
     direction: str,
     offset: int,
     diverge_from: Witness | None = None,
 ) -> Witness | None:
     """重构一份最优见证。
+
+    ``error_cap`` 为全局最优最大组误差；只回溯该硬 cap 下的加性最优路径，
+    其终点 (改动数, 总误差) 恰为全局最优，且每组误差 ≤ cap。
 
     给定 ``diverge_from`` 时，在同一配置内寻找一条与其规范形式不同的
     最优路径（沿对方路径回溯，在最后一个存在备选最优转移的单元处分叉）。
@@ -344,7 +448,7 @@ def _reconstruct(
     n, m = len(ref), len(meas)
     idx = _aligned_indices(direction, offset, m)
     vals = [meas[t] for t in idx]
-    dp, PR, PM = _scalar_dp(ref, vals, tolerance)
+    dp, PR, PM = _scalar_dp(ref, vals, error_cap)
     if dp[n][m] is None:
         return None
 
@@ -360,7 +464,7 @@ def _reconstruct(
     i, j = n, m
     diverged = diverge_from is None
     while i > 0 or j > 0:
-        opts = _optimal_transitions(dp, PR, PM, tolerance, i, j)
+        opts = _optimal_transitions(dp, PR, PM, error_cap, i, j)
         if not opts:
             return None
         if not diverged:
@@ -417,7 +521,7 @@ def solve(ref: list[int], meas: list[int], tolerance: int) -> SolveResult:
             message="间隔数量差异过大：每组至多 3 个间隔，结构上无法完成分组",
         )
 
-    mods, tot, mx, cnt = _dp_all_configs(ref, meas, tolerance)
+    mods, tot, mx = _dp_values(ref, meas, tolerance)
     col = m
     candidate_configs = range(configurations)
     reachable = [c for c in candidate_configs if mods[c, col] < _INF]
@@ -434,6 +538,12 @@ def solve(ref: list[int], meas: list[int], tolerance: int) -> SolveResult:
     best = min((int(mods[c, col]), int(tot[c, col]), int(mx[c, col])) for c in reachable)
     best_configs = [c for c in reachable
                     if (int(mods[c, col]), int(tot[c, col]), int(mx[c, col])) == best]
+
+    # 计数遍：以最优最大组误差 e* 为硬 cap，对加性 (改动数, 总误差) 求路径数。
+    # 仅需在最优配置（取得 e* 的配置）上统计；cap = e* 下这些配置的加性最优
+    # 必定恰为 (m*, t*)（否则代价遍结果被反证）。
+    best_max = best[2]
+    cnt = _dp_counts(ref, meas, best_max)
     optimal_count = 0
     saturated = False
     for c in best_configs:
@@ -444,7 +554,7 @@ def solve(ref: list[int], meas: list[int], tolerance: int) -> SolveResult:
     if saturated:
         # int64 快速路径触及饱和阈值：代价 DP 确定性一致，直接以任意精度
         # 整数重算计数，保证最优映射数精确（可超出 int64 / JS 安全整数）。
-        _, _, _, cnt_exact = _dp_all_configs(ref, meas, tolerance, exact=True)
+        cnt_exact = _dp_counts(ref, meas, best_max, exact=True)
         optimal_count = sum(int(cnt_exact[c, col]) for c in best_configs)
 
     objective = Objective(*best)
@@ -454,18 +564,18 @@ def solve(ref: list[int], meas: list[int], tolerance: int) -> SolveResult:
     best_configs.sort(key=lambda c: (0 if c < m else 1, _config_params(c, m)[1]))
 
     witnesses: list[Witness] = []
-    first = _reconstruct(ref, meas, tolerance, *_config_params(best_configs[0], m))
+    first = _reconstruct(ref, meas, best_max, *_config_params(best_configs[0], m))
     if first is not None:
         witnesses.append(first)
 
     if status == "ambiguous":
         second: Witness | None = None
         if len(best_configs) >= 2:
-            second = _reconstruct(ref, meas, tolerance, *_config_params(best_configs[1], m))
+            second = _reconstruct(ref, meas, best_max, *_config_params(best_configs[1], m))
         if second is None and first is not None:
-            second = _reconstruct(ref, meas, tolerance, *_config_params(best_configs[0], m),
+            second = _reconstruct(ref, meas, best_max, *_config_params(best_configs[0], m),
                                   diverge_from=first)
-        if second is not None and second.mapping_id() != first.mapping_id():
+        if second is not None and first is not None and second.mapping_id() != first.mapping_id():
             witnesses.append(second)
         elif second is None and first is None:
             status = "no_solution"
