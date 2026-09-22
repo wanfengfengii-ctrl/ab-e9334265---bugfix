@@ -1,0 +1,54 @@
+name: blade-align
+
+services:
+  backend:
+    build: ./backend
+    image: blade-align-backend
+    restart: unless-stopped
+    ports:
+      # 后端 API 宿主机端口（可用 API_PORT 覆盖）
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
+  frontend:
+    build: ./frontend
+    image: blade-align-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      # 前端 Web 宿主机端口（可用 WEB_PORT 覆盖）
+      - "${WEB_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  # 可执行验收服务：驱动无头浏览器完成端到端复核
+  #   docker compose --profile verify up --build --exit-code-from verify
+  verify:
+    build: ./verify
+    image: blade-align-verify
+    profiles: ["verify"]
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    environment:
+      FRONTEND_URL: http://frontend
+      ARTIFACTS_DIR: /artifacts
+    volumes:
+      - ./artifacts:/artifacts
