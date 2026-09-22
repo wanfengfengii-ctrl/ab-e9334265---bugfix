@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import itertools
+import math
 import random
 
 import pytest
 
 from app.matcher import (
+    _COUNT_SAT,
     MAX_SPAN,
     Objective,
     Witness,
@@ -233,6 +235,41 @@ def test_ambiguous_within_single_config():
     assert w1.mapping_id() != w2.mapping_id()
     for w in (w1, w2):
         assert w.objective == Objective(1, 4, 2)
+
+
+def test_ambiguous_tied_prefixes_same_offset():
+    # 回归：同一起点下仅“最大组误差”分量局部次优的前缀也必须计入。
+    # 切分 [1,2,1,1,1,1,2,1,1,1] 与 [2,1,1,1,1,1,2,1,1,1] 的前两组前缀
+    # 代价分别为 (1,2,1) 与 (1,2,2)：后者在三元逐格比较下被占优，但后续
+    # 组误差 3 拉平最大值，两者同为全局最优 (2, 18, 3)，计数必须为 2。
+    ref = [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]
+    meas = [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]
+    r = solve(ref, meas, 3)
+    assert r.status == "ambiguous"
+    assert r.objective == Objective(2, 18, 3)
+    assert r.optimal_count == 2
+    assert r.optimal_count == brute_force(ref, meas, 3)[1]
+    assert len(r.witnesses) == 2
+    w1, w2 = r.witnesses
+    assert w1.mapping_id() != w2.mapping_id()
+    assert (w1.direction, w1.offset) == (w2.direction, w2.offset) == ("forward", 3)
+    splits = sorted(tuple(g.ref_count for g in w.groups) for w in (w1, w2))
+    assert splits == [(1, 2, 1, 1, 1, 1, 2, 1, 1, 1), (2, 1, 1, 1, 1, 1, 2, 1, 1, 1)]
+    for w in (w1, w2):
+        assert w.objective == Objective(2, 18, 3)
+        _validate_witness(w, ref, meas, 3)
+
+
+def test_huge_count_exact():
+    # 超大计数：全 1 间隔下最优切分数为组合数，必然触及 int64 饱和阈值，
+    # 触发任意精度重算后仍须给出精确值（可超出 JS 安全整数）。
+    n, m = 70, 90
+    r = solve([1] * n, [1] * m, 10)
+    expected = 2 * m * math.comb(n, m - n)
+    assert expected > _COUNT_SAT  # 确认该用例确实超出 int64 快速路径
+    assert r.status == "ambiguous"
+    assert r.objective == Objective(m - n, m - n, 1)
+    assert r.optimal_count == expected
 
 
 # ---------------------------------------------------------------------------

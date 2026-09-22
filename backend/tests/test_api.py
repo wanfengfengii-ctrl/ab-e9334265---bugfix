@@ -93,6 +93,41 @@ def test_match_no_solution():
     assert data["objective"] is None
 
 
+def test_match_ambiguous_tied_prefixes_same_offset():
+    # 回归：同一起点的两种并列最优切分不得误判为唯一；
+    # 状态、精确计数、文本计数与双见证必须一致
+    payload = _payload(
+        reference={"blades": BLADES12, "intervals": [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1]},
+        measured={"intervals": [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]},
+        tolerance=3,
+        budget=2,
+    )
+    r = client.post("/api/match", json=payload)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ambiguous"
+    assert data["objective"] == {
+        "modifications": 2,
+        "totalAbsError": 18,
+        "maxGroupError": 3,
+    }
+    assert data["optimalMappingCount"] == 2
+    assert data["optimalMappingCountText"] == "2"
+    assert data["budget"] == {"limit": 2, "used": 2, "within": True}
+    assert len(data["witnesses"]) == 2
+    a, b = data["witnesses"]
+    assert a["mappingId"] != b["mappingId"]
+    assert (a["direction"], a["offset"]) == ("forward", 3)
+    assert (b["direction"], b["offset"]) == ("forward", 3)
+    splits = sorted(tuple(g["refCount"] for g in w["groups"]) for w in (a, b))
+    assert splits == [(1, 2, 1, 1, 1, 1, 2, 1, 1, 1), (2, 1, 1, 1, 1, 1, 2, 1, 1, 1)]
+    for w in (a, b):
+        mods = sum(g["modifications"] for g in w["groups"])
+        tot = sum(g["absError"] for g in w["groups"])
+        mx = max(g["absError"] for g in w["groups"])
+        assert (mods, tot, mx) == (2, 18, 3)
+
+
 def test_match_over_budget_flag():
     r = client.post("/api/match", json=_payload(budget=0))
     assert r.status_code == 200

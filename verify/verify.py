@@ -138,6 +138,41 @@ def api_ambiguous():
 
 
 @api_check
+def api_ambiguous_same_offset():
+    """API：同一起点并列最优回归（歧义，精确计数 2，双见证）"""
+    body = {
+        "reference": {
+            "blades": [f"B{i:02d}" for i in range(1, 13)],
+            "intervals": [6, 1, 5, 4, 9, 7, 8, 8, 9, 7, 8, 1],
+        },
+        "measured": {"intervals": [9, 10, 3, 5, 5, 7, 6, 6, 6, 16]},
+        "tolerance": 3,
+        "budget": 2,
+    }
+    code, data = http_json("POST", f"{API_URL}/match", body)
+    assert code == 200, data
+    assert data["status"] == "ambiguous", data["status"]
+    assert data["objective"] == {
+        "modifications": 2,
+        "totalAbsError": 18,
+        "maxGroupError": 3,
+    }, data["objective"]
+    assert data["optimalMappingCount"] == 2, data["optimalMappingCount"]
+    assert data["optimalMappingCountText"] == "2", data["optimalMappingCountText"]
+    assert data["budget"] == {"limit": 2, "used": 2, "within": True}
+    assert len(data["witnesses"]) == 2
+    a, b = data["witnesses"]
+    assert a["mappingId"] != b["mappingId"], "两份见证的规范映射必须不同"
+    splits = sorted(tuple(g["refCount"] for g in w["groups"]) for w in (a, b))
+    assert splits == [(1, 2, 1, 1, 1, 1, 2, 1, 1, 1), (2, 1, 1, 1, 1, 1, 2, 1, 1, 1)]
+    for w in (a, b):
+        mods = sum(g["modifications"] for g in w["groups"])
+        tot = sum(g["absError"] for g in w["groups"])
+        mx = max(g["absError"] for g in w["groups"])
+        assert (mods, tot, mx) == (2, 18, 3), (mods, tot, mx)
+
+
+@api_check
 def api_no_solution():
     """API：无解示例"""
     code, data = http_json("POST", f"{API_URL}/match", load_example("no-solution"))
